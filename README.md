@@ -47,6 +47,19 @@ Or double-click `start_monitor.vbs` to launch it silently with no console window
 If `nvidia-smi` is on your `PATH` (it ships with the standard NVIDIA driver), GPU usage is read directly from it — the most accurate source. If it's not found, the app falls back to Windows' `GPUEngine` performance counters (works for any vendor, slightly less precise), and if that also fails, GPU shows `N/A`.
 </details>
 
+<details>
+<summary>Optional: build a standalone <code>cpu_monitor.exe</code></summary>
+
+Running via `pythonw.exe` means Task Manager shows the process as `pythonw.exe` / "Python" rather than something recognizable. To get a real `cpu_monitor.exe` process name instead:
+
+```powershell
+pip install pyinstaller
+pyinstaller --onedir --windowed --name cpu_monitor cpu_monitor.py
+```
+
+The standalone app lands at `dist\cpu_monitor\cpu_monitor.exe` — `config.json` is created next to that exe. Point your Startup shortcut at this exe instead of `start_monitor.vbs` if you'd rather see `cpu_monitor.exe` in Task Manager.
+</details>
+
 ## Configuring the font
 
 A `config.json` is created next to the script on first run:

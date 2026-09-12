@@ -22,7 +22,9 @@ def acquire_single_instance_lock():
     already_running = ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS
     return handle, not already_running
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+_APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+    else os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
 DEFAULT_CONFIG = {"font_name": "Consolas", "font_size": 11}
 MIN_FONT_SIZE = 7
 MAX_FONT_SIZE = 24
