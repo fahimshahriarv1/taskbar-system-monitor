@@ -248,6 +248,8 @@ class TaskbarOverlay:
             x = screen_w - self.width - 200
             y = screen_h - height
         self.root.geometry(f"{self.width}x{height}+{x}+{y}")
+        self.root.lift()
+        self.root.attributes("-topmost", True)
 
     def update_values(self):
         cpu = psutil.cpu_percent(interval=None)
