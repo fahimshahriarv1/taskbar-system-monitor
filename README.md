@@ -5,7 +5,7 @@ taskbar-system-monitor
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-none-lightgrey)
 
-A tiny always-on-top text readout that docks itself right next to your Windows system tray, showing live **CPU**, **GPU**, **RAM**, and **network upload/download** stats — no hovering required.
+A tiny always-on-top text readout that docks itself right next to your Windows system tray, showing live **CPU**, **GPU(s)**, **RAM**, and **network upload/download** stats — no hovering required.
 
 ## Screenshot
 
@@ -25,7 +25,7 @@ This is the real, live overlay running on the taskbar (not a mockup):
 ## Features
 
 - Live `CPU:xx% GPU:xx% RAM:xx%` and `↑upload ↓download` readout, updated every 1.5s
-- Auto-detects your GPU — tries `nvidia-smi` first, falls back to Windows' built-in GPU performance counters, shows `N/A` if neither is available
+- On hybrid-graphics laptops, shows **both** GPUs separately (e.g. `NV:xx% iGPU:xx%`) — NVIDIA usage comes from `nvidia-smi`, the other adapter (Intel/AMD) from Windows' GPU performance counters. Falls back to a single `GPU:xx%` reading (or `N/A`) if only one is available
 - Network speed auto-scales between `B/s`, `KB/s`, `MB/s` (real bytes, not bits)
 - Matches your taskbar's light/dark theme automatically
 - Right-click the overlay to bump the font size up/down (saved to `config.json`) or quit
@@ -42,9 +42,9 @@ python cpu_monitor.py
 Or double-click `start_monitor.vbs` to launch it silently with no console window (uses `pythonw.exe`).
 
 <details>
-<summary>Optional: NVIDIA GPU users</summary>
+<summary>Optional: NVIDIA + integrated GPU users</summary>
 
-If `nvidia-smi` is on your `PATH` (it ships with the standard NVIDIA driver), GPU usage is read directly from it — the most accurate source. If it's not found, the app falls back to Windows' `GPUEngine` performance counters (works for any vendor, slightly less precise), and if that also fails, GPU shows `N/A`.
+If `nvidia-smi` is on your `PATH` (it ships with the standard NVIDIA driver), NVIDIA usage is read directly from it — the most accurate source. Any other adapter (e.g. an Intel/AMD iGPU) is read separately via Windows' `GPU Engine` performance counters, so both show up at once, e.g. `NV:12% iGPU:20%`. If nothing is detected, GPU shows `N/A`.
 </details>
 
 <details>
@@ -97,6 +97,12 @@ Tray icons in Windows are rendered at ~16px, far too small to fit readable text 
 <summary>Why does it keep calling `-topmost` every tick instead of once?</summary>
 
 The Windows taskbar is itself a special always-on-top shell window, and it periodically reasserts its own z-order above regular "topmost" application windows. Setting `-topmost` only once at startup isn't enough — the overlay re-applies it (and re-lifts itself) on every ~1.5s update cycle to keep winning that z-order fight.
+</details>
+
+<details>
+<summary>How does it tell two GPUs apart without a proper adapter API?</summary>
+
+Windows' GPU Engine performance counters report utilization per adapter LUID, but not the adapter's name — and there's no cheap way to map a LUID to "NVIDIA GeForce ..." vs "Intel UHD ..." without the DXGI adapter-enumeration API. Instead, this app leans on a reliable side effect: on hybrid-graphics laptops, the desktop compositor (DWM, which always runs as PID 4 / "System") renders through the primary/integrated adapter. So whichever LUID has a PID-4 engine instance is treated as the non-NVIDIA GPU, and NVIDIA's own number comes straight from `nvidia-smi` — no LUID matching needed for it at all.
 </details>
 
 ## Requirements

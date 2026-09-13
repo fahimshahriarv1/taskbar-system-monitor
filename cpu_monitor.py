@@ -2,6 +2,7 @@ import ctypes
 from ctypes import wintypes
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -95,13 +96,105 @@ def is_dark_taskbar():
         return True
 
 
+VIRTUAL_ADAPTER_HINTS = (
+    "basic render", "basic display", "remote display", "teamviewer",
+    "parsec", "virtual", "displaylink",
+)
+
+pdh = ctypes.windll.pdh
+PDH_FMT_DOUBLE = 0x00000200
+_PID_LUID_RE = re.compile(r"pid_(\d+)_luid_(0x[0-9A-Fa-f]+_0x[0-9A-Fa-f]+)")
+
+
+class PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
+
+
+def _short_gpu_label(name, index):
+    n = (name or "").upper()
+    if any(k in n for k in ("NVIDIA", "GEFORCE", "RTX", "GTX", "QUADRO")):
+        return "NV"
+    if "INTEL" in n:
+        return "iGPU"
+    if "AMD" in n or "RADEON" in n:
+        return "AMD"
+    return f"GPU{index}"
+
+
+def read_gpu_engine_per_luid(sample_gap=0.2):
+    """Reads per-process GPU Engine utilization via PDH, grouped by adapter LUID.
+
+    Returns (sums, primary_luids): sums maps a LUID string to its summed
+    utilization %, and primary_luids is the set of LUIDs that had a "System"
+    (PID 4) engine instance — DWM composites via the primary/integrated
+    adapter on hybrid-graphics laptops, so this reliably identifies it
+    without needing DXGI adapter enumeration.
+    """
+    hQuery = wintypes.HANDLE()
+    if pdh.PdhOpenQueryW(None, 0, ctypes.byref(hQuery)) != 0:
+        return {}, set()
+    try:
+        path_wild = r"\GPU Engine(*)\Utilization Percentage"
+        buf_size = wintypes.DWORD(0)
+        pdh.PdhExpandWildCardPathW(None, path_wild, None, ctypes.byref(buf_size), 0)
+        if buf_size.value == 0:
+            return {}, set()
+        buf = ctypes.create_unicode_buffer(buf_size.value)
+        if pdh.PdhExpandWildCardPathW(None, path_wild, buf, ctypes.byref(buf_size), 0) != 0:
+            return {}, set()
+
+        paths = []
+        offset = 0
+        while True:
+            s = ctypes.wstring_at(ctypes.addressof(buf) + offset * 2)
+            if not s:
+                break
+            paths.append(s)
+            offset += len(s) + 1
+
+        handles = []
+        for p in paths:
+            h = wintypes.HANDLE()
+            if pdh.PdhAddCounterW(hQuery, p, 0, ctypes.byref(h)) == 0:
+                handles.append((p, h))
+
+        pdh.PdhCollectQueryData(hQuery)
+        time.sleep(sample_gap)
+        pdh.PdhCollectQueryData(hQuery)
+
+        sums = {}
+        primary_luids = set()
+        for p, h in handles:
+            val = PDH_FMT_COUNTERVALUE()
+            if pdh.PdhGetFormattedCounterValue(h, PDH_FMT_DOUBLE, None, ctypes.byref(val)) != 0:
+                continue
+            m = _PID_LUID_RE.search(p)
+            if not m:
+                continue
+            pid, luid = int(m.group(1)), m.group(2)
+            sums[luid] = sums.get(luid, 0.0) + val.doubleValue
+            if pid == 4:
+                primary_luids.add(luid)
+        return {k: min(v, 100.0) for k, v in sums.items()}, primary_luids
+    except Exception:
+        return {}, set()
+    finally:
+        pdh.PdhCloseQuery(hQuery)
+
+
 class GpuReader:
-    """Auto-detects an available way to read GPU utilization and reads it."""
+    """Auto-detects available GPUs and reads per-adapter utilization.
+
+    NVIDIA usage comes from nvidia-smi (most accurate, no LUID needed at
+    all). Any other adapter (e.g. an Intel iGPU) is read via Windows'
+    GPUEngine performance counters and identified as the one DWM (PID 4)
+    renders through — see read_gpu_engine_per_luid().
+    """
 
     def __init__(self):
-        self.mode = None
-        self._wmi = None
-        self._detect()
+        self.has_nvidia_smi = self._nvidia_smi_works()
+        self.has_pdh = self._pdh_works()
+        self.other_label = self._detect_other_label() if self.has_pdh else None
 
     def _nvidia_smi_works(self):
         try:
@@ -115,29 +208,25 @@ class GpuReader:
         except Exception:
             return False
 
-    def _wmi_engine_works(self):
+    def _pdh_works(self):
         try:
-            import wmi
-            self._wmi = wmi.WMI(namespace="root\\CIMV2")
-            self._wmi.Win32_PerfFormattedData_Counters_GPUEngine()
+            read_gpu_engine_per_luid(sample_gap=0.05)
             return True
         except Exception:
             return False
 
-    def _detect(self):
-        if self._nvidia_smi_works():
-            self.mode = "nvidia_smi"
-        elif self._wmi_engine_works():
-            self.mode = "wmi_engine"
-        else:
-            self.mode = None
-
-    def read(self):
-        if self.mode == "nvidia_smi":
-            return self._read_nvidia_smi()
-        if self.mode == "wmi_engine":
-            return self._read_wmi_engine()
-        return None
+    def _detect_other_label(self):
+        try:
+            import wmi
+            w = wmi.WMI(namespace="root\\CIMV2")
+            controllers = [
+                c.Name for c in w.Win32_VideoController()
+                if c.Name and not any(h in c.Name.lower() for h in VIRTUAL_ADAPTER_HINTS)
+            ]
+            non_nvidia = [c for c in controllers if _short_gpu_label(c, 0) != "NV"]
+            return _short_gpu_label(non_nvidia[0], 0) if non_nvidia else None
+        except Exception:
+            return None
 
     def _read_nvidia_smi(self):
         try:
@@ -148,19 +237,30 @@ class GpuReader:
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
             values = [float(v) for v in out.stdout.strip().splitlines() if v.strip()]
-            if not values:
-                return None
-            return max(values)
+            return max(values) if values else None
         except Exception:
             return None
 
-    def _read_wmi_engine(self):
-        try:
-            engines = self._wmi.Win32_PerfFormattedData_Counters_GPUEngine()
-            total = sum(int(e.UtilizationPercentage) for e in engines)
-            return min(total, 100.0)
-        except Exception:
-            return None
+    def read(self):
+        """Returns a list of (label, percent) pairs, one per detected GPU."""
+        results = []
+        if self.has_nvidia_smi:
+            nv_val = self._read_nvidia_smi()
+            if nv_val is not None:
+                results.append(("NV", nv_val))
+
+        if self.has_pdh:
+            label = self.other_label or (None if self.has_nvidia_smi else "GPU")
+            if label:
+                sums, primary_luids = read_gpu_engine_per_luid()
+                if primary_luids:
+                    val = max(sums.get(luid, 0.0) for luid in primary_luids)
+                elif sums and not self.has_nvidia_smi:
+                    val = max(sums.values())
+                else:
+                    val = 0.0
+                results.append((label, val))
+        return results
 
 
 def fmt_pct(pct):
@@ -184,6 +284,9 @@ class TaskbarOverlay:
         self.font_size = self.cfg["font_size"]
 
         self.gpu_reader = GpuReader()
+        gpu_labels = [label for label, _ in self.gpu_reader.read()] or ["GPU"]
+        self.worst_line1 = "CPU:100% " + " ".join(f"{l}:100%" for l in gpu_labels) + " RAM:100%"
+        self.worst_line2 = "↑999.9MB/s ↓999.9MB/s"
         psutil.cpu_percent(interval=None)
 
         net = psutil.net_io_counters()
@@ -227,7 +330,8 @@ class TaskbarOverlay:
 
     def apply_font(self):
         self.label.config(font=(self.font_name, self.font_size))
-        self.width = int(self.font_size * 15) + 40
+        max_chars = max(len(self.worst_line1), len(self.worst_line2))
+        self.width = int(max_chars * self.font_size * 0.6) + 24
         self.height_needed = int(self.font_size * 3.2) + 14
 
     def change_font_size(self, delta):
@@ -256,7 +360,11 @@ class TaskbarOverlay:
     def update_values(self):
         cpu = psutil.cpu_percent(interval=None)
         ram = psutil.virtual_memory().percent
-        gpu = self.gpu_reader.read()
+        gpu_readings = self.gpu_reader.read()
+        gpu_part = (
+            " ".join(f"{label}:{fmt_pct(val)}" for label, val in gpu_readings)
+            if gpu_readings else "GPU:N/A"
+        )
 
         now = time.monotonic()
         net = psutil.net_io_counters()
@@ -267,7 +375,7 @@ class TaskbarOverlay:
         self.prev_bytes_recv = net.bytes_recv
         self.prev_time = now
 
-        line1 = f"CPU:{fmt_pct(cpu)} GPU:{fmt_pct(gpu)} RAM:{fmt_pct(ram)}"
+        line1 = f"CPU:{fmt_pct(cpu)} {gpu_part} RAM:{fmt_pct(ram)}"
         line2 = f"↑{fmt_speed(up_speed)} ↓{fmt_speed(down_speed)}"
         self.label.config(text=f"{line1}\n{line2}")
         self.reposition()
