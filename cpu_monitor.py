@@ -12,9 +12,24 @@ import winreg
 import psutil
 
 UPDATE_INTERVAL_MS = 1500
+GPU_QUERY_EVERY_N_TICKS = 3  # GPU (PDH-based) reads happen roughly every ~4.5s instead of every tick
 
 SINGLE_INSTANCE_MUTEX_NAME = "CpuMonitorOverlay_SingleInstance_9f3a1c7e"
 ERROR_ALREADY_EXISTS = 183
+
+_kernel32 = ctypes.windll.kernel32
+_kernel32.SetProcessWorkingSetSize.argtypes = [wintypes.HANDLE, ctypes.c_size_t, ctypes.c_size_t]
+_MAX_SIZE_T = ctypes.c_size_t(-1).value
+
+
+def trim_working_set():
+    """Hints Windows to release idle pages back after a memory-heavy burst
+    (e.g. enumerating hundreds of GPU performance counters) instead of
+    leaving them resident in the process's working set indefinitely."""
+    try:
+        _kernel32.SetProcessWorkingSetSize(_kernel32.GetCurrentProcess(), _MAX_SIZE_T, _MAX_SIZE_T)
+    except Exception:
+        pass
 
 
 def acquire_single_instance_lock():
@@ -298,7 +313,9 @@ class TaskbarOverlay:
         self.font_size = self.cfg["font_size"]
 
         self.gpu_reader = GpuReader()
-        gpu_labels = [label for label, _ in self.gpu_reader.read()] or ["GPU"]
+        self.last_gpu_readings = self.gpu_reader.read()
+        self.tick_count = 0
+        gpu_labels = [label for label, _ in self.last_gpu_readings] or ["GPU"]
         self.worst_line1 = "CPU:100% " + " ".join(f"{l}:100%" for l in gpu_labels) + " RAM:100%"
         self.worst_line2 = "↑999.9MB/s ↓999.9MB/s"
         psutil.cpu_percent(interval=None)
@@ -374,7 +391,13 @@ class TaskbarOverlay:
     def update_values(self):
         cpu = psutil.cpu_percent(interval=None)
         ram = psutil.virtual_memory().percent
-        gpu_readings = self.gpu_reader.read()
+
+        due_for_gpu_query = self.tick_count % GPU_QUERY_EVERY_N_TICKS == 0
+        self.tick_count += 1
+        if due_for_gpu_query:
+            self.last_gpu_readings = self.gpu_reader.read()
+            trim_working_set()
+        gpu_readings = self.last_gpu_readings
         gpu_part = (
             " ".join(f"{label}:{fmt_pct(val)}" for label, val in gpu_readings)
             if gpu_readings else "GPU:N/A"
