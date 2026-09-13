@@ -73,12 +73,26 @@ class RECT(ctypes.Structure):
 
 
 def get_tray_rect():
+    """Rect to dock beside: the "show hidden icons" chevron when present and
+    visible (it's the first Button child of TrayNotifyWnd), else the overall
+    notification area — which naturally sits flush against the visible icons
+    once the chevron is gone, so the overlay tracks either case correctly.
+    """
     hwnd_tray = user32.FindWindowW("Shell_TrayWnd", None)
     if not hwnd_tray:
         return None
     hwnd_notify = user32.FindWindowExW(hwnd_tray, None, "TrayNotifyWnd", None)
-    rect = RECT()
     target = hwnd_notify if hwnd_notify else hwnd_tray
+
+    if hwnd_notify:
+        hwnd_chevron = user32.FindWindowExW(hwnd_notify, None, "Button", None)
+        if hwnd_chevron and user32.IsWindowVisible(hwnd_chevron):
+            chevron_rect = RECT()
+            if user32.GetWindowRect(hwnd_chevron, ctypes.byref(chevron_rect)):
+                if chevron_rect.right > chevron_rect.left:
+                    target = hwnd_chevron
+
+    rect = RECT()
     if not user32.GetWindowRect(target, ctypes.byref(rect)):
         return None
     return rect
