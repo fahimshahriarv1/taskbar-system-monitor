@@ -2,10 +2,12 @@ taskbar-system-monitor
 =======================
 
 ![Windows](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
+![macOS](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)
+![Linux](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-none-lightgrey)
 
-A tiny always-on-top text readout that docks itself right next to your Windows system tray, showing live **CPU**, **GPU(s)**, **RAM**, and **network upload/download** stats — no hovering required.
+A tiny always-on-top text readout that docks itself right next to your system tray, showing live **CPU**, **GPU(s)**, **RAM**, and **network upload/download** stats — no hovering required. Built and actively used on Windows; macOS and Linux are supported via separate platform backends in the same file (see [Platform support](#platform-support) for what's full-featured vs. best-effort on each).
 
 ## Screenshot
 
@@ -16,6 +18,7 @@ This is the real, live overlay running on the taskbar (not a mockup):
 ## Contents
 
 - [Features](#features)
+- [Platform support](#platform-support)
 - [Quick start](#quick-start)
 - [Configuring the font](#configuring-the-font)
 - [Auto-start on boot](#auto-start-on-boot)
@@ -33,9 +36,24 @@ This is the real, live overlay running on the taskbar (not a mockup):
 - Single-instance guarded — launching it twice just no-ops instead of stacking duplicate overlays
 - Lightweight: no visible window in the taskbar/alt-tab list, minimal footprint at idle
 
+## Platform support
+
+`cpu_monitor.py` detects the OS at import time (`sys.platform`) and picks one of three self-contained backends that each implement the same handful of functions (`get_dock_rect`, `is_fullscreen_app_active`, `is_dark_mode`, `trim_working_set`, `acquire_single_instance_lock`, `GpuReader`). CPU/RAM/network reading (`psutil`) and the whole overlay UI (`TaskbarOverlay`) are shared, unmodified, across all three — only "how do I find the tray / detect fullscreen / detect dark mode / read the GPU" differs per OS.
+
+| Capability | Windows | macOS | Linux |
+|---|---|---|---|
+| Docks beside the tray | ✅ finds the exact chevron button | ⚠️ no tray-equivalent API — anchors to top-right corner instead | ⚠️ no single API across GNOME/KDE/XFCE — anchors to bottom-right corner instead |
+| GPU usage | ✅ NVIDIA (`nvidia-smi`) + any other adapter (PDH counters) | ⚠️ NVIDIA only, via `nvidia-smi` (rare on modern Macs; nothing for Apple Silicon/AMD) | ⚠️ NVIDIA (`nvidia-smi`) + AMD (`amdgpu` sysfs `gpu_busy_percent`); no Intel iGPU |
+| Auto-hide in fullscreen | ✅ | ❌ not implemented (would need `pyobjc`/Quartz) | ⚠️ X11 only via `xprop`, if installed — no effect under Wayland |
+| Light/dark theme detection | ✅ registry | ✅ `defaults read -g AppleInterfaceStyle` | ⚠️ `gsettings` (GNOME-based DEs only) |
+| Single-instance guard | ✅ named mutex | ✅ `flock` | ✅ `flock` |
+| Memory trim after GPU polling | ✅ `SetProcessWorkingSetSize` | — no simple equivalent | ✅ `malloc_trim` |
+
+The Windows backend is the one actually daily-driven (screenshots above are real). The macOS and Linux backends were written to the same design and are believed correct, but haven't been run on those OSes — if you try one and something's off, that's expected territory, not a "shouldn't happen" bug.
+
 ## Quick start
 
-```powershell
+```bash
 pip install -r requirements.txt
 python cpu_monitor.py
 ```
@@ -76,7 +94,7 @@ Edit it directly and restart, or right-click the overlay in the taskbar and pick
 
 ## Auto-start on boot
 
-To have it launch automatically at login, drop a shortcut to `start_monitor.vbs` into your Startup folder:
+**Windows** — drop a shortcut to `start_monitor.vbs` into your Startup folder:
 
 ```powershell
 $startup = [Environment]::GetFolderPath('Startup')
@@ -85,6 +103,8 @@ $s.TargetPath = "wscript.exe"
 $s.Arguments = '"<full path to>\start_monitor.vbs"'
 $s.Save()
 ```
+
+**macOS / Linux** — no auto-start integration is included yet; you'd add a `LaunchAgent` plist (macOS) or a `.desktop` file in `~/.config/autostart/` (Linux) pointing at `python3 cpu_monitor.py`.
 
 ## How it works
 
@@ -108,6 +128,7 @@ Windows' GPU Engine performance counters report utilization per adapter LUID, bu
 
 ## Requirements
 
-- Windows 10/11
 - Python 3.9+
-- See `requirements.txt` (`psutil`, `pywin32`, and `wmi` for the non-NVIDIA GPU fallback)
+- `psutil` (all platforms)
+- Windows only: `pywin32` and `wmi` (for the non-NVIDIA GPU adapter lookup) — `requirements.txt` marks these Windows-only so `pip install` doesn't try to pull them in on macOS/Linux
+- Linux: `xprop` (part of `x11-utils`) if you want fullscreen auto-hide to work; `gsettings` if you want dark-mode detection to work. Both are optional — their absence just means those features quietly no-op

@@ -1,5 +1,5 @@
 import ctypes
-from ctypes import wintypes
+import glob
 import json
 import os
 import re
@@ -7,41 +7,24 @@ import subprocess
 import sys
 import time
 import tkinter as tk
-import winreg
 
 import psutil
 
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
 UPDATE_INTERVAL_MS = 1500
-GPU_QUERY_EVERY_N_TICKS = 3  # GPU (PDH-based) reads happen roughly every ~4.5s instead of every tick
-
-SINGLE_INSTANCE_MUTEX_NAME = "CpuMonitorOverlay_SingleInstance_9f3a1c7e"
-ERROR_ALREADY_EXISTS = 183
-
-_kernel32 = ctypes.windll.kernel32
-_kernel32.SetProcessWorkingSetSize.argtypes = [wintypes.HANDLE, ctypes.c_size_t, ctypes.c_size_t]
-_MAX_SIZE_T = ctypes.c_size_t(-1).value
-
-
-def trim_working_set():
-    """Hints Windows to release idle pages back after a memory-heavy burst
-    (e.g. enumerating hundreds of GPU performance counters) instead of
-    leaving them resident in the process's working set indefinitely."""
-    try:
-        _kernel32.SetProcessWorkingSetSize(_kernel32.GetCurrentProcess(), _MAX_SIZE_T, _MAX_SIZE_T)
-    except Exception:
-        pass
-
-
-def acquire_single_instance_lock():
-    """Returns False (and leaves a stale handle unclaimed) if another copy is already running."""
-    handle = ctypes.windll.kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
-    already_running = ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS
-    return handle, not already_running
+GPU_QUERY_EVERY_N_TICKS = 3  # GPU reads happen roughly every ~4.5s instead of every tick
 
 _APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
-DEFAULT_CONFIG = {"font_name": "Consolas", "font_size": 11, "hide_in_fullscreen": True}
+DEFAULT_CONFIG = {
+    "font_name": "Consolas" if IS_WINDOWS else ("Menlo" if IS_MACOS else "monospace"),
+    "font_size": 11,
+    "hide_in_fullscreen": True,
+}
 MIN_FONT_SIZE = 7
 MAX_FONT_SIZE = 24
 
@@ -67,274 +50,6 @@ def save_config(cfg):
     except Exception:
         pass
 
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
-
-user32 = ctypes.windll.user32
-
-
-class RECT(ctypes.Structure):
-    _fields_ = [
-        ("left", wintypes.LONG),
-        ("top", wintypes.LONG),
-        ("right", wintypes.LONG),
-        ("bottom", wintypes.LONG),
-    ]
-
-
-def get_tray_rect():
-    """Rect to dock beside: the "show hidden icons" chevron when present and
-    visible (it's the first Button child of TrayNotifyWnd), else the overall
-    notification area — which naturally sits flush against the visible icons
-    once the chevron is gone, so the overlay tracks either case correctly.
-    """
-    hwnd_tray = user32.FindWindowW("Shell_TrayWnd", None)
-    if not hwnd_tray:
-        return None
-    hwnd_notify = user32.FindWindowExW(hwnd_tray, None, "TrayNotifyWnd", None)
-    target = hwnd_notify if hwnd_notify else hwnd_tray
-
-    if hwnd_notify:
-        hwnd_chevron = user32.FindWindowExW(hwnd_notify, None, "Button", None)
-        if hwnd_chevron and user32.IsWindowVisible(hwnd_chevron):
-            chevron_rect = RECT()
-            if user32.GetWindowRect(hwnd_chevron, ctypes.byref(chevron_rect)):
-                if chevron_rect.right > chevron_rect.left:
-                    target = hwnd_chevron
-
-    rect = RECT()
-    if not user32.GetWindowRect(target, ctypes.byref(rect)):
-        return None
-    return rect
-
-
-class MONITORINFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("rcMonitor", RECT),
-        ("rcWork", RECT),
-        ("dwFlags", wintypes.DWORD),
-    ]
-
-
-MONITOR_DEFAULTTONEAREST = 2
-_DESKTOP_SHELL_CLASSES = ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd")
-
-
-def is_fullscreen_app_active():
-    """True if the foreground window covers its entire monitor — the same
-    heuristic Windows' own taskbar auto-hide and other overlay utilities use
-    to detect a fullscreen game or video, including borderless-fullscreen
-    apps that don't take exclusive D3D fullscreen."""
-    hwnd = user32.GetForegroundWindow()
-    if not hwnd:
-        return False
-
-    buf = ctypes.create_unicode_buffer(256)
-    user32.GetClassNameW(hwnd, buf, 256)
-    if buf.value in _DESKTOP_SHELL_CLASSES:
-        return False
-
-    win_rect = RECT()
-    if not user32.GetWindowRect(hwnd, ctypes.byref(win_rect)):
-        return False
-
-    monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
-    if not monitor:
-        return False
-    mi = MONITORINFO()
-    mi.cbSize = ctypes.sizeof(MONITORINFO)
-    if not user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
-        return False
-    mon = mi.rcMonitor
-
-    return (win_rect.left <= mon.left and win_rect.top <= mon.top and
-            win_rect.right >= mon.right and win_rect.bottom >= mon.bottom)
-
-
-def is_dark_taskbar():
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-        )
-        value, _ = winreg.QueryValueEx(key, "SystemUsesLightTheme")
-        return value == 0
-    except Exception:
-        return True
-
-
-VIRTUAL_ADAPTER_HINTS = (
-    "basic render", "basic display", "remote display", "teamviewer",
-    "parsec", "virtual", "displaylink",
-)
-
-pdh = ctypes.windll.pdh
-PDH_FMT_DOUBLE = 0x00000200
-_PID_LUID_RE = re.compile(r"pid_(\d+)_luid_(0x[0-9A-Fa-f]+_0x[0-9A-Fa-f]+)")
-
-
-class PDH_FMT_COUNTERVALUE(ctypes.Structure):
-    _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
-
-
-def _short_gpu_label(name, index):
-    n = (name or "").upper()
-    if any(k in n for k in ("NVIDIA", "GEFORCE", "RTX", "GTX", "QUADRO")):
-        return "NV"
-    if "INTEL" in n:
-        return "iGPU"
-    if "AMD" in n or "RADEON" in n:
-        return "AMD"
-    return f"GPU{index}"
-
-
-def read_gpu_engine_per_luid(sample_gap=0.2):
-    """Reads per-process GPU Engine utilization via PDH, grouped by adapter LUID.
-
-    Returns (sums, primary_luids): sums maps a LUID string to its summed
-    utilization %, and primary_luids is the set of LUIDs that had a "System"
-    (PID 4) engine instance — DWM composites via the primary/integrated
-    adapter on hybrid-graphics laptops, so this reliably identifies it
-    without needing DXGI adapter enumeration.
-    """
-    hQuery = wintypes.HANDLE()
-    if pdh.PdhOpenQueryW(None, 0, ctypes.byref(hQuery)) != 0:
-        return {}, set()
-    try:
-        path_wild = r"\GPU Engine(*)\Utilization Percentage"
-        buf_size = wintypes.DWORD(0)
-        pdh.PdhExpandWildCardPathW(None, path_wild, None, ctypes.byref(buf_size), 0)
-        if buf_size.value == 0:
-            return {}, set()
-        buf = ctypes.create_unicode_buffer(buf_size.value)
-        if pdh.PdhExpandWildCardPathW(None, path_wild, buf, ctypes.byref(buf_size), 0) != 0:
-            return {}, set()
-
-        paths = []
-        offset = 0
-        while True:
-            s = ctypes.wstring_at(ctypes.addressof(buf) + offset * 2)
-            if not s:
-                break
-            paths.append(s)
-            offset += len(s) + 1
-
-        handles = []
-        for p in paths:
-            h = wintypes.HANDLE()
-            if pdh.PdhAddCounterW(hQuery, p, 0, ctypes.byref(h)) == 0:
-                handles.append((p, h))
-
-        pdh.PdhCollectQueryData(hQuery)
-        time.sleep(sample_gap)
-        pdh.PdhCollectQueryData(hQuery)
-
-        sums = {}
-        primary_luids = set()
-        for p, h in handles:
-            val = PDH_FMT_COUNTERVALUE()
-            if pdh.PdhGetFormattedCounterValue(h, PDH_FMT_DOUBLE, None, ctypes.byref(val)) != 0:
-                continue
-            m = _PID_LUID_RE.search(p)
-            if not m:
-                continue
-            pid, luid = int(m.group(1)), m.group(2)
-            sums[luid] = sums.get(luid, 0.0) + val.doubleValue
-            if pid == 4:
-                primary_luids.add(luid)
-        return {k: min(v, 100.0) for k, v in sums.items()}, primary_luids
-    except Exception:
-        return {}, set()
-    finally:
-        pdh.PdhCloseQuery(hQuery)
-
-
-class GpuReader:
-    """Auto-detects available GPUs and reads per-adapter utilization.
-
-    NVIDIA usage comes from nvidia-smi (most accurate, no LUID needed at
-    all). Any other adapter (e.g. an Intel iGPU) is read via Windows'
-    GPUEngine performance counters and identified as the one DWM (PID 4)
-    renders through — see read_gpu_engine_per_luid().
-    """
-
-    def __init__(self):
-        self.has_nvidia_smi = self._nvidia_smi_works()
-        self.has_pdh = self._pdh_works()
-        self.other_label = self._detect_other_label() if self.has_pdh else None
-
-    def _nvidia_smi_works(self):
-        try:
-            out = subprocess.run(
-                ["nvidia-smi", "--query-gpu=utilization.gpu",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=2,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            return out.returncode == 0 and out.stdout.strip() != ""
-        except Exception:
-            return False
-
-    def _pdh_works(self):
-        try:
-            read_gpu_engine_per_luid(sample_gap=0.05)
-            return True
-        except Exception:
-            return False
-
-    def _detect_other_label(self):
-        try:
-            import wmi
-            w = wmi.WMI(namespace="root\\CIMV2")
-            controllers = [
-                c.Name for c in w.Win32_VideoController()
-                if c.Name and not any(h in c.Name.lower() for h in VIRTUAL_ADAPTER_HINTS)
-            ]
-            non_nvidia = [c for c in controllers if _short_gpu_label(c, 0) != "NV"]
-            return _short_gpu_label(non_nvidia[0], 0) if non_nvidia else None
-        except Exception:
-            return None
-
-    def _read_nvidia_smi(self):
-        try:
-            out = subprocess.run(
-                ["nvidia-smi", "--query-gpu=utilization.gpu",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=2,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            values = [float(v) for v in out.stdout.strip().splitlines() if v.strip()]
-            return max(values) if values else None
-        except Exception:
-            return None
-
-    def read(self):
-        """Returns a list of (label, percent) pairs, one per detected GPU."""
-        results = []
-        if self.has_nvidia_smi:
-            nv_val = self._read_nvidia_smi()
-            if nv_val is not None:
-                results.append(("NV", nv_val))
-
-        if self.has_pdh:
-            label = self.other_label or (None if self.has_nvidia_smi else "GPU")
-            if label:
-                sums, primary_luids = read_gpu_engine_per_luid()
-                if primary_luids:
-                    val = max(sums.get(luid, 0.0) for luid in primary_luids)
-                elif sums and not self.has_nvidia_smi:
-                    val = max(sums.values())
-                else:
-                    val = 0.0
-                results.append((label, val))
-        return results
-
 
 def fmt_pct(pct):
     return f"{pct:.0f}%" if pct is not None else "N/A"
@@ -346,6 +61,420 @@ def fmt_speed(bytes_per_sec):
     if bytes_per_sec >= 1024:
         return f"{bytes_per_sec / 1024:.0f}KB/s"
     return f"{bytes_per_sec:.0f}B/s"
+
+
+def _nvidia_smi_available():
+    try:
+        kwargs = {"capture_output": True, "text": True, "timeout": 2}
+        if IS_WINDOWS:
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            **kwargs,
+        )
+        return out.returncode == 0 and out.stdout.strip() != ""
+    except Exception:
+        return False
+
+
+def _run_nvidia_smi():
+    """Shared across all platforms — nvidia-smi ships for Windows and Linux;
+    not applicable on Apple Silicon/AMD Macs but harmless to try."""
+    try:
+        kwargs = {"capture_output": True, "text": True, "timeout": 2}
+        if IS_WINDOWS:
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            **kwargs,
+        )
+        values = [float(v) for v in out.stdout.strip().splitlines() if v.strip()]
+        return max(values) if values else None
+    except Exception:
+        return None
+
+
+# ============================================================================
+# Windows backend
+# ============================================================================
+if IS_WINDOWS:
+    from ctypes import wintypes
+    import winreg
+
+    SINGLE_INSTANCE_MUTEX_NAME = "CpuMonitorOverlay_SingleInstance_9f3a1c7e"
+    ERROR_ALREADY_EXISTS = 183
+
+    _kernel32 = ctypes.windll.kernel32
+    _kernel32.SetProcessWorkingSetSize.argtypes = [wintypes.HANDLE, ctypes.c_size_t, ctypes.c_size_t]
+    _MAX_SIZE_T = ctypes.c_size_t(-1).value
+    user32 = ctypes.windll.user32
+    pdh = ctypes.windll.pdh
+    PDH_FMT_DOUBLE = 0x00000200
+    _PID_LUID_RE = re.compile(r"pid_(\d+)_luid_(0x[0-9A-Fa-f]+_0x[0-9A-Fa-f]+)")
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+    def trim_working_set():
+        """Hints Windows to release idle pages back after a memory-heavy burst
+        (e.g. enumerating hundreds of GPU performance counters) instead of
+        leaving them resident in the process's working set indefinitely."""
+        try:
+            _kernel32.SetProcessWorkingSetSize(_kernel32.GetCurrentProcess(), _MAX_SIZE_T, _MAX_SIZE_T)
+        except Exception:
+            pass
+
+    def acquire_single_instance_lock():
+        """Returns (handle, is_first_instance). Keep the handle referenced —
+        the lock releases when the process exits or the handle is dropped."""
+        handle = _kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+        already_running = _kernel32.GetLastError() == ERROR_ALREADY_EXISTS
+        return handle, not already_running
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", wintypes.LONG), ("top", wintypes.LONG),
+            ("right", wintypes.LONG), ("bottom", wintypes.LONG),
+        ]
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD), ("rcMonitor", RECT),
+            ("rcWork", RECT), ("dwFlags", wintypes.DWORD),
+        ]
+
+    MONITOR_DEFAULTTONEAREST = 2
+    _DESKTOP_SHELL_CLASSES = ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd")
+
+    def get_dock_rect():
+        """Rect to dock beside: the "show hidden icons" chevron when present
+        and visible (it's the first Button child of TrayNotifyWnd), else the
+        overall notification area — which naturally sits flush against the
+        visible icons once the chevron is gone, so the overlay tracks either
+        case correctly. Returns None if the taskbar can't be found (the
+        caller then falls back to a fixed screen corner).
+        """
+        hwnd_tray = user32.FindWindowW("Shell_TrayWnd", None)
+        if not hwnd_tray:
+            return None
+        hwnd_notify = user32.FindWindowExW(hwnd_tray, None, "TrayNotifyWnd", None)
+        target = hwnd_notify if hwnd_notify else hwnd_tray
+
+        if hwnd_notify:
+            hwnd_chevron = user32.FindWindowExW(hwnd_notify, None, "Button", None)
+            if hwnd_chevron and user32.IsWindowVisible(hwnd_chevron):
+                chevron_rect = RECT()
+                if user32.GetWindowRect(hwnd_chevron, ctypes.byref(chevron_rect)):
+                    if chevron_rect.right > chevron_rect.left:
+                        target = hwnd_chevron
+
+        rect = RECT()
+        if not user32.GetWindowRect(target, ctypes.byref(rect)):
+            return None
+        return rect
+
+    def is_fullscreen_app_active():
+        """True if the foreground window covers its entire monitor — the same
+        heuristic Windows' own taskbar auto-hide and other overlay utilities
+        use to detect a fullscreen game or video, including
+        borderless-fullscreen apps that don't take exclusive D3D fullscreen.
+        """
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, 256)
+        if buf.value in _DESKTOP_SHELL_CLASSES:
+            return False
+        win_rect = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(win_rect)):
+            return False
+        monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if not monitor:
+            return False
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
+            return False
+        mon = mi.rcMonitor
+        return (win_rect.left <= mon.left and win_rect.top <= mon.top and
+                win_rect.right >= mon.right and win_rect.bottom >= mon.bottom)
+
+    def is_dark_mode():
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            )
+            value, _ = winreg.QueryValueEx(key, "SystemUsesLightTheme")
+            return value == 0
+        except Exception:
+            return True
+
+    VIRTUAL_ADAPTER_HINTS = (
+        "basic render", "basic display", "remote display", "teamviewer",
+        "parsec", "virtual", "displaylink",
+    )
+
+    class PDH_FMT_COUNTERVALUE(ctypes.Structure):
+        _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
+
+    def _short_gpu_label(name, index):
+        n = (name or "").upper()
+        if any(k in n for k in ("NVIDIA", "GEFORCE", "RTX", "GTX", "QUADRO")):
+            return "NV"
+        if "INTEL" in n:
+            return "iGPU"
+        if "AMD" in n or "RADEON" in n:
+            return "AMD"
+        return f"GPU{index}"
+
+    def read_gpu_engine_per_luid(sample_gap=0.2):
+        """Reads per-process GPU Engine utilization via PDH, grouped by
+        adapter LUID. Returns (sums, primary_luids): sums maps a LUID string
+        to its summed utilization %, and primary_luids is the set of LUIDs
+        that had a "System" (PID 4) engine instance — DWM composites via the
+        primary/integrated adapter on hybrid-graphics laptops, so this
+        reliably identifies it without needing DXGI adapter enumeration.
+        """
+        hQuery = wintypes.HANDLE()
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(hQuery)) != 0:
+            return {}, set()
+        try:
+            path_wild = r"\GPU Engine(*)\Utilization Percentage"
+            buf_size = wintypes.DWORD(0)
+            pdh.PdhExpandWildCardPathW(None, path_wild, None, ctypes.byref(buf_size), 0)
+            if buf_size.value == 0:
+                return {}, set()
+            buf = ctypes.create_unicode_buffer(buf_size.value)
+            if pdh.PdhExpandWildCardPathW(None, path_wild, buf, ctypes.byref(buf_size), 0) != 0:
+                return {}, set()
+
+            paths = []
+            offset = 0
+            while True:
+                s = ctypes.wstring_at(ctypes.addressof(buf) + offset * 2)
+                if not s:
+                    break
+                paths.append(s)
+                offset += len(s) + 1
+
+            handles = []
+            for p in paths:
+                h = wintypes.HANDLE()
+                if pdh.PdhAddCounterW(hQuery, p, 0, ctypes.byref(h)) == 0:
+                    handles.append((p, h))
+
+            pdh.PdhCollectQueryData(hQuery)
+            time.sleep(sample_gap)
+            pdh.PdhCollectQueryData(hQuery)
+
+            sums = {}
+            primary_luids = set()
+            for p, h in handles:
+                val = PDH_FMT_COUNTERVALUE()
+                if pdh.PdhGetFormattedCounterValue(h, PDH_FMT_DOUBLE, None, ctypes.byref(val)) != 0:
+                    continue
+                m = _PID_LUID_RE.search(p)
+                if not m:
+                    continue
+                pid, luid = int(m.group(1)), m.group(2)
+                sums[luid] = sums.get(luid, 0.0) + val.doubleValue
+                if pid == 4:
+                    primary_luids.add(luid)
+            return {k: min(v, 100.0) for k, v in sums.items()}, primary_luids
+        except Exception:
+            return {}, set()
+        finally:
+            pdh.PdhCloseQuery(hQuery)
+
+    class GpuReader:
+        """NVIDIA usage comes from nvidia-smi (most accurate, no LUID needed
+        at all). Any other adapter (e.g. an Intel iGPU) is read via Windows'
+        GPUEngine performance counters and identified as the one DWM (PID 4)
+        renders through — see read_gpu_engine_per_luid().
+        """
+
+        def __init__(self):
+            self.has_nvidia_smi = _nvidia_smi_available()
+            self.has_pdh = self._pdh_works()
+            self.other_label = self._detect_other_label() if self.has_pdh else None
+
+        def _pdh_works(self):
+            try:
+                read_gpu_engine_per_luid(sample_gap=0.05)
+                return True
+            except Exception:
+                return False
+
+        def _detect_other_label(self):
+            try:
+                import wmi
+                w = wmi.WMI(namespace="root\\CIMV2")
+                controllers = [
+                    c.Name for c in w.Win32_VideoController()
+                    if c.Name and not any(h in c.Name.lower() for h in VIRTUAL_ADAPTER_HINTS)
+                ]
+                non_nvidia = [c for c in controllers if _short_gpu_label(c, 0) != "NV"]
+                return _short_gpu_label(non_nvidia[0], 0) if non_nvidia else None
+            except Exception:
+                return None
+
+        def read(self):
+            """Returns a list of (label, percent) pairs, one per detected GPU."""
+            results = []
+            if self.has_nvidia_smi:
+                nv_val = _run_nvidia_smi()
+                if nv_val is not None:
+                    results.append(("NV", nv_val))
+            if self.has_pdh:
+                label = self.other_label or (None if self.has_nvidia_smi else "GPU")
+                if label:
+                    sums, primary_luids = read_gpu_engine_per_luid()
+                    if primary_luids:
+                        val = max(sums.get(luid, 0.0) for luid in primary_luids)
+                    elif sums and not self.has_nvidia_smi:
+                        val = max(sums.values())
+                    else:
+                        val = 0.0
+                    results.append((label, val))
+            return results
+
+
+# ============================================================================
+# macOS backend
+# ============================================================================
+elif IS_MACOS:
+    def trim_working_set():
+        pass  # no simple equivalent to SetProcessWorkingSetSize on macOS
+
+    def acquire_single_instance_lock():
+        """Returns (open file handle, is_first_instance). Keep the handle
+        referenced — the flock releases when the process exits or the
+        handle is closed/garbage-collected."""
+        import fcntl
+        lock_path = os.path.join(_APP_DIR, ".cpu_monitor.lock")
+        f = open(lock_path, "w")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f, True
+        except OSError:
+            return f, False
+
+    def get_dock_rect():
+        return None  # no tray-equivalent API; caller falls back to a fixed corner
+
+    def is_fullscreen_app_active():
+        return False  # not implemented — would need pyobjc/Quartz; never auto-hides on macOS
+
+    def is_dark_mode():
+        try:
+            out = subprocess.run(
+                ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                capture_output=True, text=True, timeout=1,
+            )
+            return out.returncode == 0 and "dark" in out.stdout.lower()
+        except Exception:
+            return True
+
+    class GpuReader:
+        """Best-effort: only picks up an NVIDIA GPU via nvidia-smi (rare on
+        modern Macs). No public per-GPU utilization API exists for Apple
+        Silicon/AMD GPUs without private frameworks, so those show nothing.
+        """
+
+        def __init__(self):
+            self.has_nvidia_smi = _nvidia_smi_available()
+
+        def read(self):
+            if not self.has_nvidia_smi:
+                return []
+            val = _run_nvidia_smi()
+            return [("NV", val)] if val is not None else []
+
+
+# ============================================================================
+# Linux backend
+# ============================================================================
+else:
+    def trim_working_set():
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
+    def acquire_single_instance_lock():
+        """Returns (open file handle, is_first_instance). Keep the handle
+        referenced — the flock releases when the process exits or the
+        handle is closed/garbage-collected."""
+        import fcntl
+        lock_path = os.path.join(_APP_DIR, ".cpu_monitor.lock")
+        f = open(lock_path, "w")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f, True
+        except OSError:
+            return f, False
+
+    def get_dock_rect():
+        return None  # no single standard tray API across GNOME/KDE/XFCE; caller falls back to a fixed corner
+
+    def is_fullscreen_app_active():
+        """Best-effort via xprop (X11 only — no effect under Wayland or if
+        xprop isn't installed; never auto-hides in that case)."""
+        try:
+            active = subprocess.run(
+                ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+                capture_output=True, text=True, timeout=1,
+            )
+            win_id = active.stdout.strip().split()[-1]
+            state = subprocess.run(
+                ["xprop", "-id", win_id, "_NET_WM_STATE"],
+                capture_output=True, text=True, timeout=1,
+            )
+            return "_NET_WM_STATE_FULLSCREEN" in state.stdout
+        except Exception:
+            return False
+
+    def is_dark_mode():
+        try:
+            out = subprocess.run(
+                ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+                capture_output=True, text=True, timeout=1,
+            )
+            return "dark" in out.stdout.lower()
+        except Exception:
+            return True
+
+    class GpuReader:
+        """NVIDIA via nvidia-smi; AMD/Intel via the amdgpu driver's sysfs
+        gpu_busy_percent file (Intel exposes no equivalent without root +
+        intel_gpu_top, so it's not covered here)."""
+
+        def __init__(self):
+            self.has_nvidia_smi = _nvidia_smi_available()
+            self.amd_paths = sorted(glob.glob("/sys/class/drm/card*/device/gpu_busy_percent"))
+
+        def read(self):
+            results = []
+            if self.has_nvidia_smi:
+                val = _run_nvidia_smi()
+                if val is not None:
+                    results.append(("NV", val))
+            for i, path in enumerate(self.amd_paths):
+                try:
+                    with open(path) as f:
+                        val = float(f.read().strip())
+                    label = "AMD" if len(self.amd_paths) == 1 else f"AMD{i}"
+                    results.append((label, val))
+                except Exception:
+                    continue
+            return results
 
 
 class TaskbarOverlay:
@@ -369,7 +498,7 @@ class TaskbarOverlay:
         self.prev_bytes_recv = net.bytes_recv
         self.prev_time = time.monotonic()
 
-        dark = is_dark_taskbar()
+        dark = is_dark_mode()
         self.bg = "#1f1f1f" if dark else "#f3f3f3"
         self.fg = "#ffffff" if dark else "#1a1a1a"
 
@@ -378,7 +507,7 @@ class TaskbarOverlay:
         self.root.attributes("-topmost", True)
         try:
             self.root.attributes("-toolwindow", True)
-        except tk.TclError:
+        except Exception:
             pass
         self.root.configure(bg=self.bg)
 
@@ -406,8 +535,9 @@ class TaskbarOverlay:
         def show_menu(event):
             menu.tk_popup(event.x_root, event.y_root)
 
-        self.label.bind("<Button-3>", show_menu)
-        self.root.bind("<Button-3>", show_menu)
+        for button in ("<Button-3>", "<Button-2>"):
+            self.label.bind(button, show_menu)
+            self.root.bind(button, show_menu)
 
         self.reposition()
         self.update_values()
@@ -433,7 +563,7 @@ class TaskbarOverlay:
             self.is_hidden = False
 
     def reposition(self):
-        rect = get_tray_rect()
+        rect = get_dock_rect()
         if rect:
             height = max(rect.bottom - rect.top, self.height_needed)
             x = rect.left - self.width - self.GAP
@@ -442,8 +572,8 @@ class TaskbarOverlay:
             height = self.height_needed
             screen_w = self.root.winfo_screenwidth()
             screen_h = self.root.winfo_screenheight()
-            x = screen_w - self.width - 200
-            y = screen_h - height
+            x = screen_w - self.width - self.GAP
+            y = self.GAP if IS_MACOS else screen_h - height - self.GAP
         self.root.geometry(f"{self.width}x{height}+{x}+{y}")
         self.root.lift()
         self.root.attributes("-topmost", True)
@@ -496,7 +626,7 @@ class TaskbarOverlay:
 
 
 if __name__ == "__main__":
-    _mutex_handle, _is_first_instance = acquire_single_instance_lock()
+    _lock_handle, _is_first_instance = acquire_single_instance_lock()
     if not _is_first_instance:
         sys.exit(0)
     TaskbarOverlay().run()
