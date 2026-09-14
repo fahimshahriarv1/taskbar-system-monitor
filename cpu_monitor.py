@@ -41,7 +41,7 @@ def acquire_single_instance_lock():
 _APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
-DEFAULT_CONFIG = {"font_name": "Consolas", "font_size": 11}
+DEFAULT_CONFIG = {"font_name": "Consolas", "font_size": 11, "hide_in_fullscreen": True}
 MIN_FONT_SIZE = 7
 MAX_FONT_SIZE = 24
 
@@ -111,6 +111,50 @@ def get_tray_rect():
     if not user32.GetWindowRect(target, ctypes.byref(rect)):
         return None
     return rect
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+MONITOR_DEFAULTTONEAREST = 2
+_DESKTOP_SHELL_CLASSES = ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd")
+
+
+def is_fullscreen_app_active():
+    """True if the foreground window covers its entire monitor — the same
+    heuristic Windows' own taskbar auto-hide and other overlay utilities use
+    to detect a fullscreen game or video, including borderless-fullscreen
+    apps that don't take exclusive D3D fullscreen."""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return False
+
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    if buf.value in _DESKTOP_SHELL_CLASSES:
+        return False
+
+    win_rect = RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(win_rect)):
+        return False
+
+    monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    if not monitor:
+        return False
+    mi = MONITORINFO()
+    mi.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
+        return False
+    mon = mi.rcMonitor
+
+    return (win_rect.left <= mon.left and win_rect.top <= mon.top and
+            win_rect.right >= mon.right and win_rect.bottom >= mon.bottom)
 
 
 def is_dark_taskbar():
@@ -344,9 +388,18 @@ class TaskbarOverlay:
         self.label.pack(fill="both", expand=True)
         self.apply_font()
 
+        self.is_hidden = False
+        self.hide_in_fullscreen_var = tk.BooleanVar(value=self.cfg["hide_in_fullscreen"])
+
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Font size +", command=lambda: self.change_font_size(1))
         menu.add_command(label="Font size -", command=lambda: self.change_font_size(-1))
+        menu.add_separator()
+        menu.add_checkbutton(
+            label="Hide with taskbar (fullscreen apps)",
+            variable=self.hide_in_fullscreen_var,
+            command=self.toggle_hide_in_fullscreen,
+        )
         menu.add_separator()
         menu.add_command(label="Quit monitor", command=self.root.destroy)
 
@@ -372,6 +425,13 @@ class TaskbarOverlay:
         self.apply_font()
         self.reposition()
 
+    def toggle_hide_in_fullscreen(self):
+        self.cfg["hide_in_fullscreen"] = self.hide_in_fullscreen_var.get()
+        save_config(self.cfg)
+        if not self.cfg["hide_in_fullscreen"] and self.is_hidden:
+            self.root.deiconify()
+            self.is_hidden = False
+
     def reposition(self):
         rect = get_tray_rect()
         if rect:
@@ -389,6 +449,18 @@ class TaskbarOverlay:
         self.root.attributes("-topmost", True)
 
     def update_values(self):
+        should_hide = self.cfg["hide_in_fullscreen"] and is_fullscreen_app_active()
+        if should_hide != self.is_hidden:
+            if should_hide:
+                self.root.withdraw()
+            else:
+                self.root.deiconify()
+            self.is_hidden = should_hide
+
+        if should_hide:
+            self.root.after(UPDATE_INTERVAL_MS, self.update_values)
+            return
+
         cpu = psutil.cpu_percent(interval=None)
         ram = psutil.virtual_memory().percent
 

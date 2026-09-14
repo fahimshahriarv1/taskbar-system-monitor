@@ -28,6 +28,7 @@ This is the real, live overlay running on the taskbar (not a mockup):
 - On hybrid-graphics laptops, shows **both** GPUs separately (e.g. `NV:xx% iGPU:xx%`) — NVIDIA usage comes from `nvidia-smi`, the other adapter (Intel/AMD) from Windows' GPU performance counters. Falls back to a single `GPU:xx%` reading (or `N/A`) if only one is available
 - Network speed auto-scales between `B/s`, `KB/s`, `MB/s` (real bytes, not bits)
 - Matches your taskbar's light/dark theme automatically
+- Auto-hides during fullscreen games/videos (detected the same way the taskbar's own auto-hide does) so it never overlays your screen — toggle **Hide with taskbar (fullscreen apps)** in the right-click menu to keep it always on top instead
 - Right-click the overlay to bump the font size up/down (saved to `config.json`) or quit
 - Single-instance guarded — launching it twice just no-ops instead of stacking duplicate overlays
 - Lightweight: no visible window in the taskbar/alt-tab list, minimal footprint at idle
