@@ -1,4 +1,6 @@
 config.json
+debug.log
+.cpu_monitor.lock
 __pycache__/
 *.pyc
 .claude/

@@ -51,6 +51,23 @@ def save_config(cfg):
         pass
 
 
+DEBUG_LOG_PATH = os.path.join(_APP_DIR, "debug.log")
+_MAX_DEBUG_LOG_BYTES = 512 * 1024
+
+
+def log_debug(msg):
+    """Best-effort diagnostic log — used to catch rare, hard-to-reproduce
+    issues (e.g. the update loop dying silently) without needing a console.
+    Truncates itself once it gets too large so it can't grow unbounded."""
+    try:
+        if os.path.exists(DEBUG_LOG_PATH) and os.path.getsize(DEBUG_LOG_PATH) > _MAX_DEBUG_LOG_BYTES:
+            os.remove(DEBUG_LOG_PATH)
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
 def fmt_pct(pct):
     return f"{pct:.0f}%" if pct is not None else "N/A"
 
@@ -543,6 +560,7 @@ class TaskbarOverlay:
         self.apply_font()
 
         self.is_hidden = False
+        self._last_rect_key = "unset"
         self.hide_in_fullscreen_var = tk.BooleanVar(value=self.cfg["hide_in_fullscreen"])
 
         menu = tk.Menu(self.root, tearoff=0)
@@ -589,6 +607,11 @@ class TaskbarOverlay:
 
     def reposition(self):
         rect = get_dock_rect()
+        rect_key = (rect.left, rect.top, rect.right, rect.bottom) if rect else None
+        if rect_key != self._last_rect_key:
+            log_debug(f"dock rect changed: {self._last_rect_key} -> {rect_key}")
+            self._last_rect_key = rect_key
+
         if rect:
             height = max(rect.bottom - rect.top, self.height_needed)
             x = rect.left - self.width - self.GAP
@@ -605,6 +628,18 @@ class TaskbarOverlay:
         force_window_position(self.root.winfo_id(), x, y, self.width, height)
 
     def update_values(self):
+        """Thin wrapper that GUARANTEES the periodic tick keeps firing even
+        if something inside _tick() raises — without this, a single
+        uncaught exception would silently kill the reschedule and freeze
+        the overlay (text and position both) until manually restarted."""
+        try:
+            self._tick()
+        except Exception as e:
+            log_debug(f"update_values error: {e!r}")
+        finally:
+            self.root.after(UPDATE_INTERVAL_MS, self.update_values)
+
+    def _tick(self):
         should_hide = self.cfg["hide_in_fullscreen"] and is_fullscreen_app_active()
         if should_hide != self.is_hidden:
             if should_hide:
@@ -614,7 +649,6 @@ class TaskbarOverlay:
             self.is_hidden = should_hide
 
         if should_hide:
-            self.root.after(UPDATE_INTERVAL_MS, self.update_values)
             return
 
         cpu = psutil.cpu_percent(interval=None)
@@ -644,8 +678,6 @@ class TaskbarOverlay:
         line2 = f"↑{fmt_speed(up_speed)} ↓{fmt_speed(down_speed)}"
         self.label.config(text=f"{line1}\n{line2}")
         self.reposition()
-
-        self.root.after(UPDATE_INTERVAL_MS, self.update_values)
 
     def run(self):
         self.root.mainloop()
