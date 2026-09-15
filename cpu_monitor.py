@@ -108,6 +108,25 @@ if IS_WINDOWS:
     _kernel32.SetProcessWorkingSetSize.argtypes = [wintypes.HANDLE, ctypes.c_size_t, ctypes.c_size_t]
     _MAX_SIZE_T = ctypes.c_size_t(-1).value
     user32 = ctypes.windll.user32
+    user32.SetWindowPos.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+    ]
+    HWND_TOPMOST = -1
+    SWP_NOACTIVATE = 0x0010
+
+    def force_window_position(hwnd, x, y, w, h):
+        """Directly enforces position/topmost via Win32 SetWindowPos, as a
+        redundant path alongside Tk's own geometry()/attributes("-topmost").
+        Guards against a rare observed case where the overlay silently
+        stopped tracking a moved taskbar chevron despite reposition()
+        running every tick — Tk's geometry manager appeared to get stuck
+        while the rest of the app kept running normally."""
+        try:
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE)
+        except Exception:
+            pass
+
     pdh = ctypes.windll.pdh
     PDH_FMT_DOUBLE = 0x00000200
     _PID_LUID_RE = re.compile(r"pid_(\d+)_luid_(0x[0-9A-Fa-f]+_0x[0-9A-Fa-f]+)")
@@ -353,6 +372,9 @@ elif IS_MACOS:
     def trim_working_set():
         pass  # no simple equivalent to SetProcessWorkingSetSize on macOS
 
+    def force_window_position(hwnd, x, y, w, h):
+        pass  # Tk's own geometry()/attributes("-topmost") is all we have here
+
     def acquire_single_instance_lock():
         """Returns (open file handle, is_first_instance). Keep the handle
         referenced — the flock releases when the process exits or the
@@ -407,6 +429,9 @@ else:
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception:
             pass
+
+    def force_window_position(hwnd, x, y, w, h):
+        pass  # Tk's own geometry()/attributes("-topmost") is all we have here
 
     def acquire_single_instance_lock():
         """Returns (open file handle, is_first_instance). Keep the handle
@@ -577,6 +602,7 @@ class TaskbarOverlay:
         self.root.geometry(f"{self.width}x{height}+{x}+{y}")
         self.root.lift()
         self.root.attributes("-topmost", True)
+        force_window_position(self.root.winfo_id(), x, y, self.width, height)
 
     def update_values(self):
         should_hide = self.cfg["hide_in_fullscreen"] and is_fullscreen_app_active()
