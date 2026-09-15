@@ -478,7 +478,7 @@ else:
 
 
 class TaskbarOverlay:
-    GAP = 4
+    GAP = 2
 
     def __init__(self):
         self.cfg = load_config()
