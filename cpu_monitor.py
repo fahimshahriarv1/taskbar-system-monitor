@@ -129,6 +129,7 @@ if IS_WINDOWS:
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
         ctypes.c_int, ctypes.c_int, ctypes.c_uint,
     ]
+    user32.SetWindowPos.restype = wintypes.BOOL
     HWND_TOPMOST = -1
     SWP_NOACTIVATE = 0x0010
 
@@ -138,23 +139,58 @@ if IS_WINDOWS:
         Guards against a rare observed case where the overlay silently
         stopped tracking a moved taskbar chevron despite reposition()
         running every tick — Tk's geometry manager appeared to get stuck
-        while the rest of the app kept running normally."""
+        while the rest of the app kept running normally. Logs (rate-limited
+        by log_debug's own callers) if the Win32 call itself reports failure,
+        since silently swallowing that would hide exactly this kind of bug.
+        """
         try:
-            user32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE)
-        except Exception:
-            pass
+            ok = user32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE)
+            if not ok:
+                err = _kernel32.GetLastError()
+                log_debug(f"SetWindowPos FAILED hwnd={hwnd} pos=({x},{y},{w},{h}) err={err}")
+            return ok
+        except Exception as e:
+            log_debug(f"SetWindowPos exception hwnd={hwnd}: {e!r}")
+            return False
+
+    def get_window_rect(hwnd):
+        r = RECT()
+        return r if user32.GetWindowRect(hwnd, ctypes.byref(r)) else None
 
     pdh = ctypes.windll.pdh
     PDH_FMT_DOUBLE = 0x00000200
     _PID_LUID_RE = re.compile(r"pid_(\d+)_luid_(0x[0-9A-Fa-f]+_0x[0-9A-Fa-f]+)")
 
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
+    def _set_dpi_awareness():
+        """Per-Monitor-V2 (via SetThreadDpiAwarenessContext) is required to
+        avoid a documented Windows quirk: a caller that's only "Per-Monitor
+        aware" (the older v1 API, SetProcessDpiAwareness) can get a STALE,
+        internally cached rect back from GetWindowRect/FindWindowEx for
+        windows owned by other processes (like the taskbar), and that cache
+        doesn't reliably refresh on repeated polling from the same process
+        — this was directly observed and is the root cause of the overlay
+        appearing to "freeze" at an old taskbar layout while everything else
+        kept updating normally. V2 awareness queries live, every time.
+        Falls back to the older APIs on Windows versions that lack it
+        (pre-1703), which may still show the stale-cache symptom.
+        """
         try:
-            user32.SetProcessDPIAware()
+            user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+            if user32.SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2):
+                return
         except Exception:
             pass
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+    _set_dpi_awareness()
 
     def trim_working_set():
         """Hints Windows to release idle pages back after a memory-heavy burst
@@ -392,6 +428,9 @@ elif IS_MACOS:
     def force_window_position(hwnd, x, y, w, h):
         pass  # Tk's own geometry()/attributes("-topmost") is all we have here
 
+    def get_window_rect(hwnd):
+        return None
+
     def acquire_single_instance_lock():
         """Returns (open file handle, is_first_instance). Keep the handle
         referenced — the flock releases when the process exits or the
@@ -449,6 +488,9 @@ else:
 
     def force_window_position(hwnd, x, y, w, h):
         pass  # Tk's own geometry()/attributes("-topmost") is all we have here
+
+    def get_window_rect(hwnd):
+        return None
 
     def acquire_single_instance_lock():
         """Returns (open file handle, is_first_instance). Keep the handle
@@ -544,26 +586,43 @@ class TaskbarOverlay:
         self.bg = "#1f1f1f" if dark else "#f3f3f3"
         self.fg = "#ffffff" if dark else "#1a1a1a"
 
+        # self.root is a hidden Tk() that exists only to own the Tcl
+        # interpreter / mainloop and never gets destroyed until Quit.
+        # self.win is the actual visible overlay, a Toplevel — if it ever
+        # gets stuck (observed: a long-lived window can stop responding to
+        # position changes from within its own process, even though a
+        # brand-new window always positions correctly), _recreate_window()
+        # destroys and rebuilds just the Toplevel, leaving the mainloop and
+        # all app state untouched.
         self.root = tk.Tk()
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
+        self.root.withdraw()
+
+        self.is_hidden = False
+        self._last_rect_key = "unset"
+        self._mismatch_streak = 0
+        self.hide_in_fullscreen_var = tk.BooleanVar(value=self.cfg["hide_in_fullscreen"])
+
+        self._build_window()
+        self.reposition()
+        self.update_values()
+
+    def _build_window(self):
+        self.win = tk.Toplevel(self.root)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
         try:
-            self.root.attributes("-toolwindow", True)
+            self.win.attributes("-toolwindow", True)
         except Exception:
             pass
-        self.root.configure(bg=self.bg)
+        self.win.configure(bg=self.bg)
 
         self.label = tk.Label(
-            self.root, text="", bg=self.bg, fg=self.fg, padx=8, justify="left",
+            self.win, text="", bg=self.bg, fg=self.fg, padx=8, justify="left",
         )
         self.label.pack(fill="both", expand=True)
         self.apply_font()
 
-        self.is_hidden = False
-        self._last_rect_key = "unset"
-        self.hide_in_fullscreen_var = tk.BooleanVar(value=self.cfg["hide_in_fullscreen"])
-
-        menu = tk.Menu(self.root, tearoff=0)
+        menu = tk.Menu(self.win, tearoff=0)
         menu.add_command(label="Font size +", command=lambda: self.change_font_size(1))
         menu.add_command(label="Font size -", command=lambda: self.change_font_size(-1))
         menu.add_separator()
@@ -580,10 +639,19 @@ class TaskbarOverlay:
 
         for button in ("<Button-3>", "<Button-2>"):
             self.label.bind(button, show_menu)
-            self.root.bind(button, show_menu)
+            self.win.bind(button, show_menu)
 
-        self.reposition()
-        self.update_values()
+    def _recreate_window(self):
+        log_debug("recreating overlay window to recover from a stuck position")
+        was_hidden = self.is_hidden
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        self._build_window()
+        if was_hidden:
+            self.win.withdraw()
+        self._mismatch_streak = 0
 
     def apply_font(self):
         self.label.config(font=(self.font_name, self.font_size))
@@ -602,7 +670,7 @@ class TaskbarOverlay:
         self.cfg["hide_in_fullscreen"] = self.hide_in_fullscreen_var.get()
         save_config(self.cfg)
         if not self.cfg["hide_in_fullscreen"] and self.is_hidden:
-            self.root.deiconify()
+            self.win.deiconify()
             self.is_hidden = False
 
     def reposition(self):
@@ -618,14 +686,29 @@ class TaskbarOverlay:
             y = rect.top
         else:
             height = self.height_needed
-            screen_w = self.root.winfo_screenwidth()
-            screen_h = self.root.winfo_screenheight()
+            screen_w = self.win.winfo_screenwidth()
+            screen_h = self.win.winfo_screenheight()
             x = screen_w - self.width - self.GAP
             y = self.GAP if IS_MACOS else screen_h - height - self.GAP
-        self.root.geometry(f"{self.width}x{height}+{x}+{y}")
-        self.root.lift()
-        self.root.attributes("-topmost", True)
-        force_window_position(self.root.winfo_id(), x, y, self.width, height)
+        self.win.geometry(f"{self.width}x{height}+{x}+{y}")
+        self.win.lift()
+        self.win.attributes("-topmost", True)
+        self.win.update_idletasks()
+        force_window_position(self.win.winfo_id(), x, y, self.width, height)
+
+        actual = get_window_rect(self.win.winfo_id())
+        if actual and (actual.left != x or actual.top != y):
+            self._mismatch_streak += 1
+            log_debug(
+                f"position mismatch (streak={self._mismatch_streak}): "
+                f"intended=({x},{y}) actual=({actual.left},{actual.top}) "
+                f"hwnd={self.win.winfo_id()}"
+            )
+            if self._mismatch_streak >= 2:
+                self._recreate_window()
+                self.reposition()
+        else:
+            self._mismatch_streak = 0
 
     def update_values(self):
         """Thin wrapper that GUARANTEES the periodic tick keeps firing even
@@ -643,9 +726,9 @@ class TaskbarOverlay:
         should_hide = self.cfg["hide_in_fullscreen"] and is_fullscreen_app_active()
         if should_hide != self.is_hidden:
             if should_hide:
-                self.root.withdraw()
+                self.win.withdraw()
             else:
-                self.root.deiconify()
+                self.win.deiconify()
             self.is_hidden = should_hide
 
         if should_hide:
